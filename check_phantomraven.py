@@ -156,8 +156,16 @@ def scan_node_modules(project_dir: Path) -> dict[str, str]:
     return installed
 
 
+def tool_exists(name: str) -> bool:
+    """Return True if an executable is available on PATH."""
+    import shutil
+    return shutil.which(name) is not None
+
+
 def get_npm_global_packages() -> dict[str, str]:
     """Return globally installed npm packages via `npm list -g --json`."""
+    if not tool_exists("npm"):
+        return {}
     try:
         result = subprocess.run(
             ["npm", "list", "-g", "--json", "--depth=0"],
@@ -178,12 +186,14 @@ def get_bun_global_packages() -> dict[str, str]:
       1. Scan ~/.bun/install/global/node_modules/ directly (most reliable)
       2. Fall back to `bun pm ls -g` text output
     """
-    # Method 1: scan bun's global node_modules directory
+    # Method 1: scan bun's global node_modules directory (no bun binary needed)
     bun_global_nm = Path.home() / ".bun" / "install" / "global" / "node_modules"
     if bun_global_nm.exists():
         return scan_node_modules(bun_global_nm.parent)
 
     # Method 2: parse `bun pm ls -g` output  (format: "pkg@version")
+    if not tool_exists("bun"):
+        return {}
     try:
         result = subprocess.run(
             ["bun", "pm", "ls", "-g"],
@@ -203,16 +213,15 @@ def get_bun_global_packages() -> dict[str, str]:
 
 def get_brew_node_packages() -> dict[str, str]:
     """
-    Scan Homebrew-managed Node.js package paths.
-    Homebrew installs global npm packages under its own prefix, e.g.:
-      /opt/homebrew/lib/node_modules/   (Apple Silicon)
-      /usr/local/lib/node_modules/      (Intel Mac / Linux)
-    Also checks any formula cellar entries that contain node_modules.
+    Scan Homebrew-managed Node.js package paths (macOS only).
+    Only called when sys.platform == 'darwin' and brew is present.
     """
+    if not tool_exists("brew"):
+        return {}
+
     candidates: list[Path] = [
-        Path("/opt/homebrew/lib/node_modules"),
-        Path("/usr/local/lib/node_modules"),
-        Path("/home/linuxbrew/.linuxbrew/lib/node_modules"),
+        Path("/opt/homebrew/lib/node_modules"),   # Apple Silicon
+        Path("/usr/local/lib/node_modules"),       # Intel Mac
     ]
 
     # Ask brew for its prefix to catch non-standard installs
@@ -237,9 +246,30 @@ def get_brew_node_packages() -> dict[str, str]:
         if not nm_path.exists() or resolved in seen_paths:
             continue
         seen_paths.add(resolved)
-        # Reuse the existing node_modules walker by passing the parent
         pkgs = scan_node_modules(nm_path.parent)
         installed.update(pkgs)
+
+    return installed
+
+
+def get_nvm_packages() -> dict[str, str]:
+    """
+    Scan all Node.js versions managed by nvm.
+    nvm stores versions under ~/.nvm/versions/node/<version>/lib/node_modules/.
+    Checks for nvm directory presence rather than the nvm shell function,
+    since nvm is sourced into the shell and not a standalone binary.
+    """
+    nvm_dir = Path(os.environ.get("NVM_DIR", Path.home() / ".nvm"))
+    versions_root = nvm_dir / "versions" / "node"
+    if not versions_root.exists():
+        return {}
+
+    installed: dict[str, str] = {}
+    for node_ver in versions_root.iterdir():
+        nm_path = node_ver / "lib" / "node_modules"
+        if nm_path.exists():
+            pkgs = scan_node_modules(nm_path.parent)
+            installed.update(pkgs)
 
     return installed
 
@@ -490,7 +520,8 @@ def main():
     print(f"\n{CYAN}PhantomRaven Supply-Chain Attack Checker{RESET}")
     print(f"CSV source : {CSV_FILE}")
     print(f"Project    : {project_dir}")
-    print(f"Global scan: {'disabled (--no-global)' if args.skip_global else 'npm + bun + Homebrew'}")
+    global_tools = "npm + bun + nvm" + (" + Homebrew" if sys.platform == "darwin" else "")
+    print(f"Global scan: {'disabled (--no-global)' if args.skip_global else global_tools}")
 
     # Load malicious package list
     malicious = load_malicious_packages(CSV_FILE)
@@ -521,22 +552,43 @@ def main():
     # 4. Global stores (always on unless --no-global)
     if not args.skip_global:
         # 4a. Global npm
-        print(f"  {CYAN}Scanning global npm...{RESET}", end=" ", flush=True)
-        npm_global = get_npm_global_packages()
-        register("global npm", npm_global)
-        print(f"{len(npm_global)} packages" if npm_global else "not found / empty")
+        if tool_exists("npm"):
+            print(f"  {CYAN}Scanning global npm...{RESET}", end=" ", flush=True)
+            npm_global = get_npm_global_packages()
+            register("global npm", npm_global)
+            print(f"{len(npm_global)} packages" if npm_global else "not found / empty")
+        else:
+            print(f"  {YELLOW}Skipping global npm — npm not found on PATH{RESET}")
 
         # 4b. Global bun
-        print(f"  {CYAN}Scanning global bun...{RESET}", end=" ", flush=True)
-        bun_global = get_bun_global_packages()
-        register("global bun", bun_global)
-        print(f"{len(bun_global)} packages" if bun_global else "not found / empty")
+        bun_global_nm = Path.home() / ".bun" / "install" / "global" / "node_modules"
+        if tool_exists("bun") or bun_global_nm.exists():
+            print(f"  {CYAN}Scanning global bun...{RESET}", end=" ", flush=True)
+            bun_global = get_bun_global_packages()
+            register("global bun", bun_global)
+            print(f"{len(bun_global)} packages" if bun_global else "not found / empty")
+        else:
+            print(f"  {YELLOW}Skipping bun — not installed{RESET}")
 
-        # 4c. Homebrew node paths
-        print(f"  {CYAN}Scanning Homebrew node paths...{RESET}", end=" ", flush=True)
-        brew_pkgs = get_brew_node_packages()
-        register("Homebrew node_modules", brew_pkgs)
-        print(f"{len(brew_pkgs)} packages" if brew_pkgs else "not found / empty")
+        # 4c. nvm
+        nvm_dir = Path(os.environ.get("NVM_DIR", Path.home() / ".nvm"))
+        if (nvm_dir / "versions" / "node").exists():
+            print(f"  {CYAN}Scanning nvm Node versions...{RESET}", end=" ", flush=True)
+            nvm_pkgs = get_nvm_packages()
+            register("nvm", nvm_pkgs)
+            print(f"{len(nvm_pkgs)} packages" if nvm_pkgs else "not found / empty")
+        else:
+            print(f"  {YELLOW}Skipping nvm — ~/.nvm/versions/node not found{RESET}")
+
+        # 4d. Homebrew — macOS only
+        if sys.platform == "darwin":
+            if tool_exists("brew"):
+                print(f"  {CYAN}Scanning Homebrew node paths...{RESET}", end=" ", flush=True)
+                brew_pkgs = get_brew_node_packages()
+                register("Homebrew node_modules", brew_pkgs)
+                print(f"{len(brew_pkgs)} packages" if brew_pkgs else "not found / empty")
+            else:
+                print(f"  {YELLOW}Skipping Homebrew — brew not found on PATH{RESET}")
 
     if not scanned:
         print(f"\n{YELLOW}No package.json, package-lock.json, node_modules, or global installs found.{RESET}")
